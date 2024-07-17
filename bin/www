@@ -1,0 +1,350 @@
+#!/usr/bin/env node
+
+/**
+ * Module dependencies.
+ */
+
+var app = require('../app');
+var debug = require('debug')('socketiotest:server');
+var http = require('http');
+var cron = require('node-cron');
+const Sx5dCron = require('../cronjobs/Sx5d');
+const Sx5d = require('../models/games/Sx5d');
+const historyBet = require('../models/games/historyBet');
+const users = require('../models/users');
+const settings = require('../models/settings');
+
+const fs = require('fs');
+const path = require('path');
+
+/**
+ * Get port from environment and store in Express.
+ */
+
+var port = normalizePort(process.env.PORT || '3000');
+app.set('port', port);
+
+/**
+ * Create HTTP server.
+ */
+
+var server = http.createServer(app);
+
+/**
+ * Listen on provided port, on all network interfaces.
+ */
+
+server.listen(port);
+server.on('error', onError);
+server.on('listening', onListening);
+
+const io = require('socket.io')(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+const sessions = [];
+
+// Load all event modules
+const eventModules = fs.readdirSync(path.join(__dirname, '..', 'modules')).reduce((acc, file) => {
+  const eventName = path.basename(file, '.js');
+  acc[eventName] = require(path.join(__dirname, '..', 'modules', file));
+  return acc;
+}, {});
+
+io.on('connection', (socket) => {
+  for (const event in eventModules) {
+    if (eventModules.hasOwnProperty(event)) {
+      console.log('Registering event:', event);
+      eventModules[event](socket);
+    }
+  }
+  socket.on('controllgame', async (data) => {
+
+    const isValid = validateInput(data.betData);
+    if (!isValid) {
+      socket.emit('controllgameResponse', { status: 'fail', message: 'Dữ liệu không hợp lệ' });
+      return;
+    }
+    const session = Sx5d.findOne({ _id: data.sessionID });
+    if (!session) {
+      socket.emit('controllgameResponse', { status: 'fail', message: 'Session không tồn tại' });
+      return;
+    }
+    // validate data 1,2,3,4,5
+    let betData = data.betData.split(',');
+
+    // convert string to number
+    betData = betData.map(item => parseInt(item));
+    const num1 = betData[0];
+    const num2 = betData[1];
+    const num3 = betData[2];
+    const num4 = betData[3];
+    const num5 = betData[4];
+
+    const result = num1 + num2 + num3 + num4 + num5;
+
+    const sessionBet = {
+      betData: [num1, num2, num3, num4, num5],
+      result: result,
+      big: result > 22 ? true : false,
+      small: result < 23 ? true : false,
+      odd: result % 2 !== 0 ? true : false,
+      even: result % 2 === 0 ? true : false,
+      resultMoney: 0,
+      resultOdd: result % 2 !== 0 ? true : false,
+      resultEven: result % 2 === 0 ? true : false,
+    }
+
+    const updateBetData = await Sx5d.findOneAndUpdate({ _id: data.sessionID }, {
+      $set: sessionBet
+    }, { new: true });
+
+    // update sessions array with new data
+    sessions[sessions.length - 1] = updateBetData;
+
+    if (!updateBetData) {
+      socket.emit('controllgameResponse', { status: 'fail', message: 'Cập nhật dữ liệu thất bại' });
+      return;
+    }
+
+    socket.emit('controllgameResponse', { status: 'success', data: updateBetData });
+  });
+});
+function validateInput(inputString) {
+  const pattern = /^\d,\d,\d,\d,\d$/;
+  return pattern.test(inputString);
+}
+
+
+const getGame = async (type = 'sx5d') => {
+
+  let a = null;
+  a = setInterval(async () => {
+    // get session bet lastest
+    let session = sessions.filter(session => session.type === type);
+
+
+
+    session = session[session.length - 1];
+    // get session lastest
+    const sessionToClient = session.toObject();
+    // get time start and time end
+    const timeStart = new Date(sessionToClient.timeStart).getTime();
+    const timeEnd = new Date(sessionToClient.timeEnd).getTime();
+    const now = new Date().getTime();
+    // time text to show on client
+    const timeText = `${new Date(sessionToClient.timeStart).getHours()}:${new Date(sessionToClient.timeStart).getMinutes()} - ${new Date(sessionToClient.timeEnd).getHours()}:${new Date(sessionToClient.timeEnd).getMinutes()}`;
+    // time remain
+    const timeRemain = timeEnd - now;
+    // time remain text
+    const timeRemainText = `00:0${Math.floor(timeRemain / 60000)}:${Math.floor((timeRemain % 60000) / 1000) < 10 ? '0' + Math.floor((timeRemain % 60000) / 1000) : Math.floor((timeRemain % 60000) / 1000)}`;
+    // tra ve time remain text cho client la dang mm:ss:ms
+    // add time text and time remain text to session
+    sessionToClient.timeText = timeText;
+    // add time remain to session
+    sessionToClient.timeRemain = timeRemainText;
+    // // check time start and time end
+    if (now >= timeStart && now <= timeEnd) {
+      // send data to client
+      io.emit(type, sessionToClient);
+    } else {
+      // clear interval
+      clearInterval(a);
+      setTimeout(async () => {
+        const historyBetResult = await historyBet.find({ betDataID: sessionToClient._id });
+        const resultBet = sessionToClient?.betData;
+
+        if (historyBetResult.length > 0) {
+          for (const item of historyBetResult) {
+            const betDataInUser = item.betInUser;
+            if (betDataInUser.length > 0) {
+              const settingsData = await settings.findOne({ name: 'game' });
+              const winnings = checkWin(resultBet, betDataInUser, settingsData.value, type);
+
+              if (winnings.length > 0) {
+                // check winner and send prize is special
+
+                const special = winnings.filter(item => item.prize === 'Special');
+                const Thua = winnings.filter(item => item.prize === 'Thua');
+
+                if (special.length > 0) {
+                  const user = await users.findOne({ _id: item.userID });
+                  let amountAItem = item.amount / item.betInUser.length;
+                  // let totalPrize = special.length * amountAItem * 1.98;
+                  // totalPrize sẽ được tính theo tỉ lệ 5% của tổng số tiền cược và trả lại số tiền cược
+                  let totalPrize = item.amount * 0.05 + item.amount;
+                  user.balance += totalPrize;
+                  await user.save();
+                  const historyFind = await historyBet.findOne({ _id: item._id });
+                  historyFind.win = totalPrize;
+                  console.log(totalPrize - item.amount, 'totalPrize - item.amount');
+                  historyFind.interest = totalPrize - item.amount;
+                  await historyFind.save();
+                  const userData = await users.findOne({ _id: item.userID });
+                  io.emit(`win-${item.userID}-${type}`, { userID: item.userID, prize: userData.balance });
+                } else if(Thua.length > 0) {
+                  const user = await users.findOne({ _id: item.userID });
+                  let amountAItem = item.amount / item.betInUser.length;
+                  // let totalPrize = Thua.length * amountAItem * 1.98;
+                  // tính ra 5% tổng số tiền cược
+                  const totalPrize5 = item.amount * 0.05;
+                  // user.balance - 5% tổng số tiền cược
+
+                  const historyFind = await historyBet.findOne({ _id: item._id });
+                  user.balance += historyFind.amount
+                  user.balance -= totalPrize5;
+                  await user.save();
+                  historyFind.win = totalPrize5;
+                  console.log(totalPrize5 - item.amount);
+                  historyFind.interest = totalPrize5 - item.amount;
+                  await historyFind.save();
+                  const userData = await users.findOne({ _id: item.userID });
+
+                  io.emit(`win-${item.userID}-${type}`, { userID: item.userID, prize: userData.balance });
+                } else {
+                  const user = await users.findOne({ _id: item.userID });
+                  let amountAItem = item.amount / item.betInUser.length;
+                  let totalPrize = winnings.length * amountAItem * 1.98;
+
+                  user.balance += totalPrize;
+                  await user.save();
+                  const historyFind = await historyBet.findOne({ _id: item._id });
+                  historyFind.win = totalPrize;
+                  historyFind.interest = totalPrize - item.amount;
+                  await historyFind.save();
+                  const userData = await users.findOne({ _id: item.userID });
+                  io.emit(`win-${item.userID}-${type}`, { userID: item.userID, prize: userData.balance });
+                }
+              } else {
+                const user = await users.findOne({ _id: item.userID });
+                io.emit(`lose-${item.userID}-${type}`, { userID: item.userID, prize: user.balance });
+              }
+            }
+          }
+        }
+        createSession(type);
+      }, 5 * 1000);
+
+    }
+  }, 1000);
+
+}
+
+const createSession = async (type = 'sx5d') => {
+  const session = await Sx5dCron.createSx5d(type);
+  sessions.push(session);
+  getGame(type);
+}
+// createSession('sx5d');
+// createSession('xs2');
+// createSession('veso');
+// createSession('mayman');
+// createSession('nhanh3');
+// createSession('pkdon');
+// createSession('veso1');
+// createSession('3d');
+
+function checkWin(results, bets, setting = '2.1', type = 'sx5d') {
+  const prizeTypes = {
+    1: 'Large',
+    2: 'Small',
+    3: 'Odd',
+    4: 'Even'
+  };
+
+  let prize = [];
+
+  bets.forEach(bet => {
+    const { id, value } = bet;
+    const result = results[id];
+
+    // Kiểm tra điều kiện setting == '2.1' và id == 0
+    if (id === 0 && (value === 1 || value === 2) && type === 'sx5d') {
+      if(setting === '2.1') {
+        prize.push({ id, prize: 'Special' });
+      } else {
+        prize.push({ id, prize: 'Thua' });
+      }
+    } else {
+      if (value === 1 && result > 2) { // Large (number > 2)
+        prize.push({ id, prize: prizeTypes[1] });
+      } else if (value === 2 && result <= 2) { // Small (number <= 2)
+        prize.push({ id, prize: prizeTypes[2] });
+      } else if (value === 3 && result % 2 !== 0) { // Odd (number is odd)
+        prize.push({ id, prize: prizeTypes[3] });
+      } else if (value === 4 && result % 2 === 0) { // Even (number is even)
+        prize.push({ id, prize: prizeTypes[4] });
+      }
+    }
+  });
+
+  return prize;
+}
+
+
+// setInterval(() => {
+//   console.log('running a task after 1m30s from the previous interval', Date.now());
+
+
+// }, 65 * 1000);
+/**
+ * Normalize a port into a number, string, or false.
+ */
+
+function normalizePort(val) {
+  var port = parseInt(val, 10);
+
+  if (isNaN(port)) {
+    // named pipe
+    return val;
+  }
+
+  if (port >= 0) {
+    // port number
+    return port;
+  }
+
+  return false;
+}
+
+/**
+ * Event listener for HTTP server "error" event.
+ */
+
+function onError(error) {
+  if (error.syscall !== 'listen') {
+    throw error;
+  }
+
+  var bind = typeof port === 'string'
+    ? 'Pipe ' + port
+    : 'Port ' + port;
+
+  // handle specific listen errors with friendly messages
+  switch (error.code) {
+    case 'EACCES':
+      console.error(bind + ' requires elevated privileges');
+      process.exit(1);
+      break;
+    case 'EADDRINUSE':
+      console.error(bind + ' is already in use');
+      process.exit(1);
+      break;
+    default:
+      throw error;
+  }
+}
+
+/**
+ * Event listener for HTTP server "listening" event.
+ */
+
+function onListening() {
+  var addr = server.address();
+  var bind = typeof addr === 'string'
+    ? 'pipe ' + addr
+    : 'port ' + addr.port;
+  debug('Listening on ' + bind);
+}
